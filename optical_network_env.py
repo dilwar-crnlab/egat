@@ -29,6 +29,9 @@ class OpticalNetworkEnv(gym.Env):
     ):
         assert topology is None or "ksp" in topology.graph
         assert topology is None or "k_paths" in topology.graph
+
+        
+
         self._events: List[Tuple[float, Service]] = []
         self.current_time: float = 0
         self.episode_length: int = episode_length
@@ -45,117 +48,267 @@ class OpticalNetworkEnv(gym.Env):
         self.mean_service_holding_time: float = 0
         self.mean_service_inter_arrival_time: float = 0
         self.set_load(load=load, mean_service_holding_time=mean_service_holding_time)
-
         self.rand_seed: Optional[int] = None
         self.rng: random.Random = None
         self.seed(seed=seed)
-
-
-        # Convert topology to directed if it's not already xd950
-        # if not isinstance(topology, nx.DiGraph):
-        #     self.topology = nx.DiGraph(topology)
-        # else:
-        #     self.topology = copy.deepcopy(topology)
-        self.topology: nx.Graph = copy.deepcopy(topology)
-        #print("Topology edges:",self.topology.edges)
-
-        # Edge indexing for directed edges
-        # edge_index = 0
-        # for u, v in self.topology.edges():
-        #     self.topology[u][v]['index'] = edge_index
-        #     edge_index += 1
-
+        self.topology: nx.DiGraph = copy.deepcopy(topology)
+        self.transformed_topo=nx.line_graph(self.topology)
+        self.edge_to_index = {(u, v): self.topology[u][v]['index'] for u, v in self.topology.edges()}
+        self.index_mapping = {edge: self.edge_to_index[edge] for edge in self.transformed_topo.nodes()}
+        self.transformed = nx.relabel_nodes(self.transformed_topo, self.index_mapping)
         self.topology_name: str = topology.graph["name"]
         self.k_paths: int = self.topology.graph["k_paths"]
-        print("ksp", self.k_paths)
-        self.compute_node_degrees(self.topology)
-        self.compute_edge_betweenness(self.topology)
-        #self.print_edge_indices()
-
-        # just as a more convenient way to access it
         self.k_shortest_paths = self.topology.graph["ksp"]
-        assert (node_request_probabilities is None or len(node_request_probabilities) == self.topology.number_of_nodes())
-        
+        self.global_TSG = self.construct_tsg()
+
+        self.global_node_edge_vectors = self.construct_vectors()
+
+        self.global_edge_adj_matrix = self.construct_edge_adj_matrix()
+
+        self.global_node_adj_matrix = self.construct_node_adj_matrix()
+
+        self.node_betweenness = self.compute_node_features()
+
+        self.topology.graph['link_spans'] = self.compute_and_store_link_spans()
+
+        assert (node_request_probabilities is None
+            or len(node_request_probabilities) == self.topology.number_of_nodes()
+        )
         self.num_spectrum_resources: int = num_spectrum_resources
 
         # channel width in GHz
         self.channel_width: float = channel_width
         self.topology.graph["num_spectrum_resources"] = num_spectrum_resources
-
-        # self.topology.graph["available_spectrum"] = np.full(
-        #     (self.topology.number_of_edges()),
-        #     fill_value=self.num_spectrum_resources,
-        #     dtype=int
-        # )
-        
-        # Initialize spectrum for directed edges
         self.topology.graph["available_spectrum"] = np.full(
             (self.topology.number_of_edges()),
             fill_value=self.num_spectrum_resources,
-            dtype=int
+            dtype=int,
         )
-
         if node_request_probabilities is not None:
             self.node_request_probabilities = node_request_probabilities
         else:
-            self.node_request_probabilities = np.full((self.topology.number_of_nodes()),fill_value=1.0 / self.topology.number_of_nodes(),)
-            
-    def compute_node_degrees(self, topology):
-        """
-        Computes the degree of each node and stores it in topology.graph.
-        Also computes and stores the average, minimum, and maximum node degrees.
-        
-        The degree information is stored in:
-        - topology.graph['node_degrees']: Dictionary of node degrees
-        - topology.graph['avg_node_degree']: Average node degree
-        - topology.graph['min_node_degree']: Minimum node degree
-        - topology.graph['max_node_degree']: Maximum node degree
-        """
-        # Initialize dictionary to store node degrees
-        node_degrees = {}
-        
-        # Compute degree for each node
-        for node in self.topology.nodes():
-            degree = self.topology.degree(node)
-            node_degrees[node] = degree
-        
-        # Calculate statistics
-        degrees = list(node_degrees.values())
-        avg_degree = sum(degrees) / len(degrees)
-        min_degree = min(degrees)
-        max_degree = max(degrees)
-        
+            self.node_request_probabilities = np.full(
+                (self.topology.number_of_nodes()), fill_value=1.0 / self.topology.number_of_nodes())
+
+        #print((self.topology.edges))   
+
+    def compute_and_store_link_spans(self):
+        # Create a dictionary to store spans count
+        spans_dict = {}
+        for node1, node2 in self.topology.edges():
+            id=self.topology[node1][node2]["index"]
+            #print(id)
+            num_spans = len(self.topology[node1][node2]["link"].spans)
+            spans_dict[id] = num_spans
         # Store in topology.graph
-        self.topology.graph['node_degrees'] = node_degrees
-        self.topology.graph['avg_node_degree'] = avg_degree
-        self.topology.graph['min_node_degree'] = min_degree
-        self.topology.graph['max_node_degree'] = max_degree
-
-
-    # Method to print edge indices
-    def print_edge_indices(self):
-        print("\nEdge Indices:")
-        print("Edge (source->destination) : Index")
-        print("---------------------------------")
-        for u, v in self.topology.edges():
-            edge_index = self.topology[u][v]['index']
-            print(f"Edge ({u}->{v}) : {edge_index}")
-
-    def compute_edge_betweenness(self, topology):
-        # Compute edge betweenness centrality
-        edge_betweenness = nx.edge_betweenness_centrality(self.topology)
         
-        # Find max for normalization
-        max_betweenness = max(edge_betweenness.values())
-        
-        # Store normalized values in topology
-        for edge in self.topology.edges():
-            node1, node2 = edge
-            normalized_betweenness = edge_betweenness[edge] / max_betweenness
-            self.topology[node1][node2]['betweenness'] = normalized_betweenness
+        return spans_dict 
 
-        # Also store max value for reference
-        self.topology.graph['max_betweenness'] = max_betweenness
+    def compute_node_features(self):
+        node_betweeness=nx.betweenness_centrality(self.topology, normalized=True, weight='length')
+
+        # Invert values (for maximization):
+        inverted_betweenness = {node: 1 - value for node, value in node_betweeness.items()}
+        return inverted_betweenness
+
+    def construct_node_adj_matrix(self):
+        # Get k_shortest_paths from topology
+        k_shortest_paths = self.topology.graph["ksp"]
+        # Dictionary to store subgraphs
+        pair_subgraphs = {}
+        node_pair_adj_matrix = {}
+        topo_nodes=self.topology.nodes()
+        #nodes = sorted(topology.nodes())  # Ensure nodes are sorted correctly (starting from 1)
+        N = len(topo_nodes)  # Total number of nodes
+        #rint("Nodes", topo_nodes)
+        # Create a mapping from node ID to matrix index
+        node_to_index = {topo_nodes: idx for idx, topo_nodes in enumerate(topo_nodes)}
+        # Initialize NxN adjacency matrix with zeros
+        
+        # Process each source-destination pair
+        for (src, dst), paths in k_shortest_paths.items():
+            # Process all paths for this src-dst pair
+            paths_adj_matrix = {}
+            for path in range(len(paths)):
+                adjacency_matrix = np.zeros((N, N), dtype=int)
+                subgraph_edges = set()
+                # Convert node list to integers
+                nodes =  paths[path].node_list
+                start_node = nodes[0]
+                end_node = nodes[-1]
+                intermediate_nodes = nodes[1:-1]
+                
+                # Get path edges and their reverses
+                for i in range(len(nodes) - 1):
+                    # Add path edge
+                    subgraph_edges.add((nodes[i], nodes[i + 1]))
+                    # Record reverse edge for later removal
+                    subgraph_edges.add((nodes[i + 1], nodes[i]))
+                
+                for node in intermediate_nodes:
+                    for edge in self.topology.in_edges(node):
+                        subgraph_edges.add(edge)
+            # Include all edges ending at the start node
+                subgraph_edges.update((u, start_node) for u in self.topology.predecessors(start_node))
+                # Include all edges starting from the end node
+                subgraph_edges.update((v, end_node) for v in self.topology.predecessors(end_node))
+                # Create subgraph for this src-dst pair
+                subgraph = self.topology.edge_subgraph(subgraph_edges).copy()
+
+                for u, v in subgraph.edges():
+                    adjacency_matrix[node_to_index[u], node_to_index[v]] = 1  # Mark edge existence
+                # Store with src-dst key
+                paths_adj_matrix[path] = adjacency_matrix
+                node_pair_adj_matrix[src,dst]=paths_adj_matrix
+
+            
+
+        return node_pair_adj_matrix
+
+    def construct_edge_adj_matrix(self):
+        
+        k_shortest_paths = self.topology.graph["ksp"]
+        pair_subgraphs = {}
+        edge_labels = nx.get_edge_attributes(self.topology, 'id')
+        sorted_edges = sorted(edge_labels.items(), key=lambda x: x[1])  # Sort by edge ID
+        E = len(sorted_edges)
+        edge_id_to_index = {edge_id: idx for idx, (edge, edge_id) in enumerate(sorted_edges)}
+        pair_edge_adj_matrix = {}
+        # Process each source-destination pair
+        for (src, dst), paths in k_shortest_paths.items():
+            path_edge_adj_matrix = {}
+            for path in range(len(paths)):
+                adjacency_matrix = np.zeros((E, E), dtype=int)   
+                subgraph_edges = set()
+                nodes = paths[path].node_list  # Convert nodes to integers
+                start_node = nodes[0]
+                end_node = nodes[-1]
+                intermediate_nodes = nodes[1:-1]
+                # Get path edges 
+                for i in range(len(nodes) - 1):
+                    subgraph_edges.add((nodes[i], nodes[i + 1]))
+
+                for node in intermediate_nodes:
+                    for edge in self.topology.in_edges(node):
+                        subgraph_edges.add(edge)
+            # Include all edges ending at the start node
+                subgraph_edges.update((u, start_node) for u in self.topology.predecessors(start_node))
+                # Include all edges starting from the end node and any of the path nodes
+                # Include all edges starting from the end node to any of the path nodes
+                subgraph_edges.update((end_node, v) for v in self.topology.successors(end_node) if v in nodes)
+                # Create subgraph for this src-dst pair
+                subgraph = self.topology.edge_subgraph(subgraph_edges).copy()
+                pair_subgraphs[(src, dst, path)] = subgraph
+
+                line_graph = nx.line_graph(subgraph)
+                # Fill the adjacency matrix with entries from the line graph
+                for edge_u, edge_v in line_graph.edges():
+                    # Get the indices of the edges based on their ID mapping
+                    if edge_u in edge_labels and edge_v in edge_labels:
+                        u_idx = edge_id_to_index[edge_labels[edge_u]]
+                        v_idx = edge_id_to_index[edge_labels[edge_v]]
+                        # Mark connection in the adjacency matrix
+                        adjacency_matrix[u_idx, v_idx] = 1
+                path_edge_adj_matrix[path]=adjacency_matrix
+                pair_edge_adj_matrix[src, dst]=path_edge_adj_matrix
+        return pair_edge_adj_matrix
+
+
+
+
+    def construct_vectors(self):
+        N = self.topology.number_of_nodes()
+        E = self.topology.number_of_edges()
+
+        global_matrices ={}
+        k_shortest_paths = self.topology.graph["ksp"]
+        for (src, dst), paths in k_shortest_paths.items():
+            #print(paths)
+            num_paths = len(paths)
+            node_path_mem_vec = np.zeros((N, num_paths))
+            edge_path_mem_vec = np.zeros((E, num_paths))
+            for path_idx, path in enumerate(paths):
+                for link_idx in path.link_idx:
+                    edge_path_mem_vec[link_idx][path_idx] = 1
+
+                for node in path.node_list:
+                    node_idx = self.topology.nodes[node]["index"]
+                    node_path_mem_vec[node_idx][path_idx] = 1
+
+                self.topology.graph
+                global_matrices[src, dst]={
+                    'edge_vector': edge_path_mem_vec,
+                    'node_vector': node_path_mem_vec
+                }   
+
+        return global_matrices
+
+    def construct_tsg(self) -> dict:
+        """
+        Construct TSG from pre-transformed topology for all source-destination pairs.
+        
+        Args:
+            topology: Original topology
+            transformed_topo: Pre-transformed topology (line graph)
+            k_shortest_paths: Dictionary containing k-shortest paths
+            
+        Returns:
+            dict: Dictionary containing TSG, adjacency matrix and feature matrix for each s-d pair
+        """
+        global_TSG = {}
+        N = len(self.transformed.nodes())  # Total number of nodes in transformed topology
+        
+        # Process each source-destination pair
+        for (src, dst), paths in self.k_shortest_paths.items():
+            #print(f"\nProcessing source {src} to destination {dst}")
+            
+            # Collect all link indices used in these paths
+            link_indices = set()
+            for path in paths:
+                link_indices.update(path.link_idx)
+            
+            # Create subgraph with only the nodes (transformed from links) we need
+            tsg = self.transformed.subgraph(link_indices).copy()
+            
+            # Add path membership information to nodes
+            for node in tsg.nodes():
+                path_indices = []
+                for path_idx, path in enumerate(paths):
+                    if node in path.link_idx:
+                        path_indices.append(path_idx)
+                tsg.nodes[node]['path_indices'] = path_indices
+            
+            # Create adjacency matrix
+            adjacency_matrix = np.zeros((N, N))
+            for path in paths:
+                for i in range(len(path.link_idx) - 1):
+                    current_link = path.link_idx[i]
+                    next_link = path.link_idx[i + 1]
+                    adjacency_matrix[current_link][next_link] = 1
+            
+            # Create feature matrix
+            num_paths = len(paths)
+            X = np.zeros((N, num_paths))
+            for path_idx, path in enumerate(paths):
+                for link_idx in path.link_idx:
+                    X[link_idx][path_idx] = 1
+            
+            # Add graph level information
+            tsg.graph['paths'] = paths
+            tsg.graph['k_paths'] = len(paths)
+            tsg.graph['source'] = src
+            tsg.graph['destination'] = dst
+            
+            # Store in global_TSG dictionary
+            global_TSG[(src, dst)] = {
+                'tsg': tsg,
+                'adjacency_matrix': adjacency_matrix,
+                'feature_matrix': X,
+                'num_paths': num_paths,
+                'paths': paths
+            }
+            
+        return global_TSG
 
     def set_load(self, load: float = None, mean_service_holding_time: float = None) -> None:
         """
@@ -168,10 +321,12 @@ class OpticalNetworkEnv(gym.Env):
         if load is not None:
             self.load = load
         if mean_service_holding_time is not None:
-            self.mean_service_holding_time = (mean_service_holding_time ) # current_service holding time in seconds
-            
-        self.mean_service_inter_arrival_time = 1 / float(self.load / float(self.mean_service_holding_time))
-        
+            self.mean_service_holding_time = (
+                mean_service_holding_time  # current_service holding time in seconds
+            )
+        self.mean_service_inter_arrival_time = 1 / float(
+            self.load / float(self.mean_service_holding_time)
+        )
 
     def _plot_topology_graph(self, ax) -> None:
         pos = nx.get_node_attributes(self.topology, "pos")
@@ -221,24 +376,9 @@ class OpticalNetworkEnv(gym.Env):
         # (self.topology[a][b]['plot_label']
 
     def _add_release(self, service: Service) -> None:
-        """
-        Adds an event to the event list of the simulator.
-        This implementation is based on the functionalities of heapq:
-        https://docs.python.org/2/library/heapq.html
-
-        :param event:
-        :return: None
-        """
-        heapq.heappush(
-            self._events, (service.arrival_time + service.holding_time, service)
-        )
+        heapq.heappush(self._events, (service.arrival_time + service.holding_time, service))
 
     def _get_node_pair(self) -> Tuple[str, int, str, int]:
-        """
-        Uses the `node_request_probabilities` variable to generate a source and a destination.
-
-        :return: source node, source node id, destination node, destination node id
-        """
         src = self.rng.choices([x for x in self.topology.nodes()], weights=self.node_request_probabilities)[0]
         src_id = self.topology.graph["node_indices"].index(src)
         new_node_probabilities = np.copy(self.node_request_probabilities)
@@ -263,15 +403,10 @@ class OpticalNetworkEnv(gym.Env):
         self.episode_services_accepted = 0
 
         self.topology.graph["available_spectrum"] = np.full(
-            self.topology.number_of_edges(), 
+            self.topology.number_of_edges(),
             fill_value=self.num_spectrum_resources,
             dtype=int,
         )
-        # # Initialize spectrum resources for directed edges
-        # self.topology.graph["available_slots"] = np.ones(
-        #     (self.topology.number_of_edges(), self.num_spectrum_resources), 
-        #     dtype=int
-        # )
 
         self.topology.graph["services"] = []
         self.topology.graph["running_services"] = []
