@@ -1,808 +1,764 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from stable_baselines3.common.policies import ActorCriticPolicy
-from torch.distributions import Categorical
-
-class EGATLayer(nn.Module):
-    def __init__(self, node_dim, edge_dim, out_dim):
-        super().__init__()
-             
-        # Transformation layers
-        self.W_H = nn.Linear(node_dim, out_dim)  # Node features
-        self.W_E_C = nn.Linear(edge_dim, out_dim)  # C-band edge features
-        self.W_E_L = nn.Linear(edge_dim, out_dim)  # L-band edge features
-        
-        # Initialize attention parameters
-        # For concatenated [hidden_dim + hidden_dim + hidden_dim]
-        attention_dim_b = 2 * out_dim + node_dim  # Three times hidden_dim after transformations
-        attention_dim_a = 3 * out_dim
-        self.a_C = nn.Parameter(torch.FloatTensor(attention_dim_a, 1))
-        self.a_L = nn.Parameter(torch.FloatTensor(attention_dim_a, 1))
-        self.b_C = nn.Parameter(torch.FloatTensor(attention_dim_b, 1))
-        self.b_L = nn.Parameter(torch.FloatTensor(attention_dim_b, 1))
-        
-        self.leaky_relu = nn.LeakyReLU(0.2)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        """Initialize attention parameters"""
-        gain = nn.init.calculate_gain('relu')
-        nn.init.xavier_uniform_(self.a_C, gain=gain)
-        nn.init.xavier_uniform_(self.a_L, gain=gain)
-        nn.init.xavier_uniform_(self.b_C, gain=gain)
-        nn.init.xavier_uniform_(self.b_L, gain=gain)
-        
-    def edge_attention_block(self, H, E_C, E_L, AE, MH, path_edge_indices):
-        batch_size = E_C.size(0)
-        M = E_C.size(1)
-        
-        # Transform edge features
-        E_C_trans = self.W_E_C(E_C)
-        E_L_trans = self.W_E_L(E_L)
-        
-        # Initialize attention scores
-        C_attention_scores = torch.zeros(batch_size, M, M, device=E_C.device)
-        L_attention_scores = torch.zeros(batch_size, M, M, device=E_C.device)
-        
-        # Process each path edge
-        for p in path_edge_indices:
-            # Get all neighbors (both path and non-path)
-            neighbor_edges = torch.where(AE[0,p] > 0)[0]
-            #print("Neighbor edge", neighbor_edges)
-            
-            for q in neighbor_edges:
-                # Get shared node features
-                h_pq = self._get_shared_node_features(H, MH, p, q)
-
-                # C-band attention
-                c_concat = torch.cat([
-                    E_C_trans[:,p],
-                    E_C_trans[:,q],
-                    h_pq
-                ], dim=-1)
-                
-
-                C_attention_scores[:,p,q] = self.leaky_relu(
-                    torch.matmul(c_concat, self.b_C).squeeze(-1)
-                )
-                
-                # L-band attention
-                l_concat = torch.cat([
-                    E_L_trans[:,p],
-                    E_L_trans[:,q],
-                    h_pq
-                ], dim=-1)
-                L_attention_scores[:,p,q] = self.leaky_relu(
-                    torch.matmul(l_concat, self.b_L).squeeze(-1)
-                )
-        
-        # Update path edge features
-        E_C_new = E_C_trans.clone()
-        E_L_new = E_L_trans.clone()
-        
-        for p in path_edge_indices:
-            neighbor_edges = torch.where(AE[0,p] > 0)[0]
-            if len(neighbor_edges) > 0:
-                # Normalize attention scores
-                C_attn = F.softmax(C_attention_scores[:,p,neighbor_edges], dim=-1)
-                L_attn = F.softmax(L_attention_scores[:,p,neighbor_edges], dim=-1)
-                
-                # Update features
-                E_C_new[:,p] = torch.sum(
-                    C_attn.unsqueeze(-1) * E_C_trans[:,neighbor_edges],
-                    dim=1
-                )
-                E_L_new[:,p] = torch.sum(
-                    L_attn.unsqueeze(-1) * E_L_trans[:,neighbor_edges],
-                    dim=1
-                )
-                
-        return E_C_new, E_L_new
-    
-    def node_attention_block(self, H, E_C_star, E_L_star, AH, path_node_indices):
-        """
-        Node attention block
-        """
-        batch_size, N, _ = H.size()
-        
-        # Transform all features to same dimension (hidden_dim)
-        H_trans = self.W_H(H)  # [batch_size, N, hidden_dim]
-        E_C_trans = self.W_E_C(E_C_star)  # Transform to same hidden_dim
-        E_L_trans = self.W_E_L(E_L_star)  # Transform to same hidden_dim
-        
-        # Initialize attention scores
-        C_attention_scores = torch.zeros(batch_size, N, N, device=H.device)
-        L_attention_scores = torch.zeros(batch_size, N, N, device=H.device)
-        
-        # Process each path node
-        for i in path_node_indices:
-            neighbor_nodes = torch.where(AH[0,i] > 0)[0]
-            
-            for j in neighbor_nodes:
-                # C-band attention
-                c_concat = torch.cat([
-                    H_trans[:,i],           # [batch_size, hidden_dim]
-                    H_trans[:,j],           # [batch_size, hidden_dim]
-                    E_C_trans[:,i,j]        # [batch_size, hidden_dim]
-                ], dim=-1)                  # Result: [batch_size, 3*hidden_dim]
-                
-                # print('Inside node attention block')
-                # print("H_trans[:,i]:", H_trans[:,i].shape)
-                # print("H_trans[:,j]:", H_trans[:,j].shape)
-                # print("E_C_trans[:,i,j] :", E_C_trans[:,i,j] .shape)
-                # print("c_concat:", c_concat.shape)
-                # print("self.a_C:", self.a_C.shape)
-
-                C_attention_scores[:,i,j] = self.leaky_relu(
-                    torch.matmul(c_concat, self.a_C)
-                ).squeeze(-1)
-                
-                # L-band attention
-                l_concat = torch.cat([
-                    H_trans[:,i],
-                    H_trans[:,j],
-                    E_L_trans[:,i,j]
-                ], dim=-1)
-                
-                L_attention_scores[:,i,j] = self.leaky_relu(
-                    torch.matmul(l_concat, self.a_L)
-                ).squeeze(-1)
-        
-        # Initialize outputs
-        H_C_new = H_trans.clone()
-        H_L_new = H_trans.clone()
-        Hm_C = torch.zeros_like(H_trans)
-        Hm_L = torch.zeros_like(H_trans)
-        
-        # Update features for path nodes
-        for i in path_node_indices:
-            neighbor_nodes = torch.where(AH[0,i] > 0)[0]
-            if len(neighbor_nodes) > 0:
-                C_attn = F.softmax(C_attention_scores[:,i,neighbor_nodes], dim=-1)
-                L_attn = F.softmax(L_attention_scores[:,i,neighbor_nodes], dim=-1)
-                
-                # Update node features
-                H_C_new[:,i] = torch.sum(C_attn.unsqueeze(-1) * H_trans[:,neighbor_nodes], dim=1)
-                H_L_new[:,i] = torch.sum(L_attn.unsqueeze(-1) * H_trans[:,neighbor_nodes], dim=1)
-                
-                # Update edge-integrated features
-                Hm_C[:,i] = torch.sum(
-                    C_attn.unsqueeze(-1) * (H_trans[:,neighbor_nodes] * E_C_trans[:,i,neighbor_nodes]),
-                    dim=1
-                )
-                Hm_L[:,i] = torch.sum(
-                    L_attn.unsqueeze(-1) * (H_trans[:,neighbor_nodes] * E_L_trans[:,i,neighbor_nodes]),
-                    dim=1
-                )
-        
-        return H_C_new, H_L_new, Hm_C, Hm_L
-
-    def forward(self, H, E_C, E_L, AH, AE, ME, MH, path_node_indices, path_edge_indices):
-        # Print input shapes for debugging
-        # print("\nInput shapes:")
-        # print("H shape:", H.shape)
-        # print("E_C shape:", E_C.shape)
-        # print("E_L shape:", E_L.shape)
-        # print("AH shape:", AH.shape)
-        # print("AE shape:", AE.shape)
-        # print("ME shape:", ME.shape)
-        # print("MH shape:", MH.shape)
-        # Transform edge features to adjacency form
-        E_C_star = self._transform_edge_features(E_C, ME)
-        E_L_star = self._transform_edge_features(E_L, ME)
-        
-        # Node attention
-        H_C_new, H_L_new, Hm_C, Hm_L = self.node_attention_block(H, E_C_star, E_L_star, AH, path_node_indices)
-        
-        # Edge attention
-        E_C_new, E_L_new = self.edge_attention_block(H, E_C, E_L, AE, MH, path_edge_indices)
-        
-        # Combine features
-        H_new = (H_C_new + H_L_new) / 2
-        Hm = (Hm_C + Hm_L) / 2
-        
-        return H_new, E_C_new, E_L_new, Hm
-    
-
-    def _transform_edge_features(self, E, ME):
-        """
-        Transform edge features using edge mapping matrix ME
-        Args:
-            E: Edge features [batch_size, M, Fe]  # M = 45 (total edges)
-            ME: Edge mapping matrix [batch_size, N*N, M]  # N*N = 25, M = 45
-        """
-        batch_size = E.size(0)
-        M = E.size(1)
-        Fe = E.size(2)
-        
-        # Transform edge features
-        E_transformed = torch.bmm(ME, E)  # [batch_size, N*N, Fe]
-        
-        # Reshape to adjacency form
-        N = int(torch.sqrt(torch.tensor(ME.size(1))))
-        E_star = E_transformed.view(batch_size, N, N, Fe)
-        
-        return E_star
-
-    def _get_shared_node_features(self, H, MH, edge1, edge2):
-        """
-        Get features of node shared between two edges
-        """
-        #batch_size = H.size(0)
-        #node_dim = H.size(-1)
-        #print(H.size)
-        batch_size, num_nodes, node_dim = H.shape
-        #print(batch_size, num_nodes, node_dim)
-
-        # Find nodes connected to edge1 and edge2
-        nodes_edge1 = MH[:, edge1, :].nonzero(as_tuple=False)[:, 1]
-        nodes_edge2 = MH[:, edge2, :].nonzero(as_tuple=False)[:, 1]
-
-        #print("edge1:",nodes_edge1, "edge2",nodes_edge2)
-
-        # Identify shared node
-        shared_nodes = self.intersect1d(nodes_edge1, nodes_edge2)
-        # Handle case where a shared node exists
-        if shared_nodes.numel() > 0:
-            shared_node = shared_nodes[0]  # Assuming a single shared node
-            return H[:, shared_node, :]
-        else:
-            # If no shared node, return zeros
-            return torch.zeros(batch_size, node_dim, device=H.device)
-        
-    def intersect1d(self, tensor1, tensor2):
-        """
-        Compute the intersection of two 1D tensors.
-        Args:
-            tensor1: 1D tensor.
-            tensor2: 1D tensor.
-        Returns:
-            Tensor containing the intersection of tensor1 and tensor2.
-        """
-        return tensor1[(tensor1.unsqueeze(1) == tensor2).any(dim=1)]
-        
-        
-    
+import tensorflow as tf
 
 
-class EGATNetwork(nn.Module):
-    def __init__(self, node_dim, edge_dim, hidden_dim=64, num_layers=2, num_heads=8):
-        super().__init__()
-        
-        # Stack of EGAT layers
-        self.layers = nn.ModuleList([
-            EGATLayer(
-                node_dim if i==0 else hidden_dim,
-                edge_dim if i==0 else hidden_dim,
-                hidden_dim
-            ) for i in range(num_layers)
-        ])
-        
-        # Multi-scale merge parameters
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.merge_weights = nn.Parameter(
-            torch.FloatTensor(num_heads, num_layers)
-        )
-        
-        # Output layers
-        service_info_size = 29
-        combined_size = hidden_dim + service_info_size
-        
-        self.action_head = nn.Sequential(
-            nn.Linear(combined_size, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 20)  # 5 paths * 2 bands * 2 fits
-        )
-        
-        self.value_head = nn.Sequential(
-            nn.Linear(combined_size, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
-        
-        self.reset_parameters()
-        
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.merge_weights)
-    
-    def multi_scale_merge(self, H_list, Hm_list):
-        """
-        Merge features from different layers and heads
-        """
-        batch_size = H_list[0].size(0)
-        
-        # Initialize merged features
-        merged_features = []
-        
-        # For each attention head
-        for k in range(self.num_heads):
-            head_features = []
-            
-            # Merge features from each layer
-            for l in range(self.num_layers):
-                # Combine node and edge-integrated features
-                layer_features = H_list[l] + Hm_list[l]
-                
-                # Weight by merge parameter
-                weighted_features = self.merge_weights[k,l] * layer_features
-                head_features.append(weighted_features)
-            
-            # Stack layer features
-            head_output = torch.stack(head_features, dim=1)
-            merged_features.append(head_output)
-        
-        # Average over heads
-        merged = torch.mean(torch.stack(merged_features), dim=0)
-        
-        # Global mean pooling
-        merged = torch.mean(merged, dim=1)
-        
-        return merged
-    
-    def forward(self, H, E_C, E_L, AH, AE, ME, MH, service_info, path_node_indices, path_edge_indices):
-        # Store features from each layer
-        H_list = []
-        Hm_list = []
-        
-        # Forward through EGAT layers
-        current_H = H
-        current_E_C = E_C
-        current_E_L = E_L
-        
-        for layer in self.layers:
-            current_H, current_E_C, current_E_L, current_Hm = layer(
-                current_H,
-                current_E_C,
-                current_E_L,
-                AH, AE, ME, MH,
-                path_node_indices,
-                path_edge_indices
-            )
-            
-            H_list.append(current_H)
-            Hm_list.append(current_Hm)
-        
-        # Multi-scale merge
-        merged_features = self.multi_scale_merge(H_list, Hm_list)
-
-        # Global mean pooling over layers
-        merged_features = torch.mean(merged_features, dim=1)  # [batch_size, hidden_dim]
-        
-        # Combine with service info
-        combined = torch.cat([merged_features, service_info], dim=1)
-        
-        # Get action logits and value
-        action_logits = self.action_head(combined)
-        value = self.value_head(combined)
-        
-        return action_logits, value
-
-class CustomActorCriticPolicy(ActorCriticPolicy):
-    def __init__(self, observation_space, action_space, lr_schedule, *args, **kwargs):
-        super().__init__(observation_space, action_space, lr_schedule, *args, **kwargs)
-        
-        # Constants
-        self.k_paths = 5
-        self.max_path_length = 9
-        self.edge_feature_dim = 16
-        self.node_feature_dim = 1
-        
-        # Calculate dimensions
-        self.num_edge_features = self.k_paths * self.max_path_length * self.edge_feature_dim
-        self.num_node_features = self.k_paths * self.node_feature_dim
-        self.num_service_info = 29
-        
-        # Initialize EGAT network
-        self.egat_network = EGATNetwork(
-            node_dim=self.node_feature_dim,
-            edge_dim=8,  # Each band has 8 features
-            hidden_dim=64,
-            num_layers=2,
-            num_heads=8
-        )
-        
-        # Initialize matrices
-        self.register_buffer('node_indices', None)
-        self.register_buffer('edge_indices', None)
-        self.register_buffer('AH', None)
-        self.register_buffer('AE', None)
-        self.register_buffer('ME', None)
-        self.register_buffer('MH', None)
-    
-    def _process_observation(self, obs):
-        """
-        Process raw observation into EGAT inputs
-        """
-        batch_size = obs.shape[0]
-        device = obs.device
-        
-        # Debug dimensions
-        #print("Input observation shape:", obs.shape)
-        #print("Bathc size", batch_size)
-        
-        # 1. Extract and reshape edge features
-        edge_features = obs[:, :self.num_edge_features].view(
-            batch_size, 
-            self.k_paths,
-            self.max_path_length, 
-            self.edge_feature_dim
-        )
-        #print("Edge features shape:", edge_features.shape)
-        
-        # Reshape edge features for attention computation
-        c_band_features = edge_features[...,:8].reshape(batch_size, -1, 8)   # [batch, k_paths*max_path_length, 8]
-        l_band_features = edge_features[...,8:].reshape(batch_size, -1, 8)   # [batch, k_paths*max_path_length, 8]
-        
-        #print("C-band features shape:", c_band_features.shape)
-        #print("L-band features shape:", l_band_features.shape)
-        
-        # 2. Extract node features
-        node_features = obs[:, 
-                        self.num_edge_features:self.num_edge_features+self.num_node_features
-                        ].view(batch_size, self.k_paths, self.node_feature_dim)
-        #print("Node features shape:", node_features.shape)
-        
-        # 3. Extract service info
-        service_info = obs[:, -self.num_service_info:]
-        #print("Service info shape:", service_info.shape)
-        # Iterate over each batch and print the service info
-        #for batch_idx in range(service_info.size(0)):
-        #    print(f"Service info for batch {batch_idx}: {service_info[batch_idx].tolist()}")
-        
-        # 4. Get path indices and build matrices if not already done
-        if self.node_indices is None:
-            path_node_indices, path_edge_indices = self._get_path_indices(edge_features)
-            self.node_indices = torch.tensor(path_node_indices, device=device)
-            self.edge_indices = torch.tensor(path_edge_indices, device=device)
-            
-            self.AH, self.AE, self.ME, self.MH = self._build_matrices(
-                edge_features,
-                self.node_indices,
-                self.edge_indices
-            )
-            # print("AH shape:", self.AH.shape)
-            # print("AE shape:", self.AE.shape)
-            # print("ME shape:", self.ME.shape)
-            # print("MH shape:", self.MH.shape)
-
-        
-        #Example of what each service request looks like:
-        for batch_idx in range(batch_size):
-            print(f"\nService request {batch_idx}:")
-            # # Get source and destination from one-hot encoding
-            # source_idx = torch.where(service_info[batch_idx, :self.topology.number_of_nodes()])[0]
-            # dest_idx = torch.where(service_info[batch_idx, self.topology.number_of_nodes():-1])[0]
-            # bit_rate = service_info[batch_idx, -1].item() * 200  # Denormalize
-            # print(f"Source: {source_idx.item()}, Destination: {dest_idx.item()}, Bit Rate: {bit_rate} Gbps")
-
-            num_nodes = (self.num_service_info - 1) // 2  # -1 for bit rate
-        
-            # Get source and destination indices from one-hot encodings
-            source_idx = torch.argmax(service_info[batch_idx, :num_nodes])
-            dest_idx = torch.argmax(service_info[batch_idx, num_nodes:-1])
-            bit_rate = service_info[batch_idx, -1] * 200  # Denormalize
-            print(f"Source: {source_idx.item()}, Destination: {dest_idx.item()}, Bit Rate: {bit_rate:.1f} Gbps")
-            
-            # Print features for all k paths
-            for path_idx in range(self.k_paths):
-                print(f"\nPath {path_idx} features:")
-                
-                # Get start and end indices for this path's features
-                start_idx = path_idx * self.max_path_length
-                end_idx = start_idx + self.max_path_length
-                
-                print("C-band features:")
-                print(c_band_features[batch_idx, start_idx:end_idx])
-                
-                print("L-band features:")
-                print(l_band_features[batch_idx, start_idx:end_idx])
-
-                #return (node_features, c_band_features, l_band_features, service_info)
-        
-        return (node_features, c_band_features, l_band_features, service_info)
-
-    def _get_path_indices(self, edge_features):
-        """
-        Get indices of nodes and edges in paths
-        """
-        node_set = set()
-        edge_list = []
-        
-        # For each path
-        for path_idx in range(self.k_paths):
-            # Get valid nodes in current path
-            valid_edges = torch.any(edge_features[0,path_idx] != 0, dim=-1)
-            nodes_in_path = torch.nonzero(valid_edges).squeeze(-1)
-            
-            for node_idx in nodes_in_path:
-                node_set.add(path_idx)
-            
-            # Get valid edges
-            for i in range(len(nodes_in_path) - 1):
-                edge_idx = path_idx * (self.max_path_length - 1) + i
-                edge_list.append(edge_idx)
-        
-        return list(node_set), edge_list
-
-    def _build_matrices(self, edge_features, node_indices, edge_indices):
-        """
-        Build adjacency and mapping matrices
-        Args:
-            edge_features: [batch_size, k_paths, max_path_length, edge_dim]
-        Returns:
-            Matrices with matching batch size
-        """
-        batch_size = edge_features.size(0)
-        total_edges = self.k_paths * self.max_path_length  # 5 * 9 = 45 edges total
-        device = edge_features.device
-        
-        # 1. Node adjacency matrix (AH)
-        AH = torch.zeros(batch_size, self.k_paths, self.k_paths, device=device)
-        
-        for i in node_indices:
-            for j in range(self.k_paths):
-                path_i = edge_features[:,i,:,:]
-                path_j = edge_features[:,j,:,:]
-                shared = torch.any(torch.all(path_i.unsqueeze(2) == path_j.unsqueeze(1), dim=-1))
-                if shared:
-                    AH[:,i,j] = 1
-                    AH[:,j,i] = 1
-        
-        # Add self-loops
-        AH.diagonal(dim1=1, dim2=2).fill_(1)
-        
-        # 2. Edge adjacency matrix (AE)
-        AE = torch.zeros(batch_size, total_edges, total_edges, device=device)
-        
-        # Connect edges sharing nodes in paths
-        for i in range(total_edges):
-            path_i = i // self.max_path_length
-            pos_i = i % self.max_path_length
-            
-            for j in range(total_edges):
-                path_j = j // self.max_path_length
-                pos_j = j % self.max_path_length
-                
-                # Check if edges are connected (share a node)
-                if pos_i + 1 == pos_j or pos_i == pos_j + 1:
-                    if path_i == path_j:  # Same path
-                        AE[:,i,j] = 1
-                        AE[:,j,i] = 1
-        
-        # Add self-loops
-        AE.diagonal(dim1=1, dim2=2).fill_(1)
-        
-        # 3. Edge mapping matrix (ME)
-        ME = torch.zeros(batch_size, self.k_paths * self.k_paths, total_edges, device=device)
-        
-        # Map edges to their paths
-        for i in range(total_edges):
-            path_idx = i // self.max_path_length
-            ME[:,path_idx*self.k_paths:(path_idx+1)*self.k_paths,i] = 1
-        
-        # 4. Node mapping matrix (MH)
-        MH = torch.zeros(batch_size, total_edges, self.k_paths, device=device)
-        
-        # Map edges to their path nodes
-        for i in range(total_edges):
-            path_idx = i // self.max_path_length
-            MH[:,i,path_idx] = 1
-        
-        # print("\nBuilt matrices shapes:")
-        # print("AH shape:", AH.shape)
-        # print("AE shape:", AE.shape)
-        # print("ME shape:", ME.shape)
-        # print("MH shape:", MH.shape)
-        
-        return AH, AE, ME, MH
-
-    def forward(self, obs, deterministic=False):
-        """
-        Policy forward pass
-        """
-        # Process observation
-        node_features, c_band_features, l_band_features, service_info = self._process_observation(obs)
-        
-        # Forward through EGAT network
-        action_logits, values = self.egat_network(
-            node_features,
-            c_band_features,
-            l_band_features,
-            self.AH,
-            self.AE,
-            self.ME,
-            self.MH,
-            service_info,
-            self.node_indices,
-            self.edge_indices
-        )
-        
-        # Get action distribution
-        distribution = self.get_distribution(action_logits)
-        
-        # Sample action
-        if deterministic:
-            actions = distribution.mode()
-        else:
-            actions = distribution.sample()
-            
-        log_prob = distribution.log_prob(actions)
-        
-        return actions, values, log_prob
-
-    def evaluate_actions(self, obs, actions):
-        """
-        Evaluate actions for training
-        """
-        node_features, c_band_features, l_band_features, service_info = self._process_observation(obs)
-        
-        action_logits, values = self.egat_network(
-            node_features,
-            c_band_features,
-            l_band_features,
-            self.AH,
-            self.AE,
-            self.ME,
-            self.MH,
-            service_info,
-            self.node_indices,
-            self.edge_indices
-        )
-        
-        distribution = self.get_distribution(action_logits)
-        log_prob = distribution.log_prob(actions)
-        entropy = distribution.entropy()
-        
-        return values, log_prob, entropy
-
-    def get_distribution(self, action_logits):
-        """
-        Convert logits to categorical distribution
-        """
-        action_probs = F.softmax(action_logits, dim=-1)
-        return Categorical(probs=action_probs)
-    
-
+import numpy as np
+import os
+import pickle
+import gym
+from collections import deque
+import time
 
 import os
 import pickle
-import numpy as np
-import torch
 import gym
-from stable_baselines3 import A2C
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import BaseCallback
-from torch.utils.tensorboard import SummaryWriter
-from stable_baselines3.common.results_plotter import load_results, ts2xy
+import scipy
 
-class SaveOnBestTrainingRewardCallback(BaseCallback):
-    def __init__(self, check_freq: int, log_dir: str, verbose=1):
-        super().__init__(verbose)
+import numpy as np
+from datetime import datetime
+from tqdm import tqdm
+
+class EGATLayer(tf.keras.layers.Layer):
+    def __init__(self, output_dim, num_heads=8, dropout_rate=0.2):
+        super(EGATLayer, self).__init__()
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+        self.dropout_rate = dropout_rate
+
+    def build(self, input_shape):
+        # Node feature transformation
+        self.WH = self.add_weight(
+            shape=(1, self.output_dim),  # For scalar betweenness
+            initializer='glorot_uniform',
+            name='node_transform'
+        )
+
+        # Edge feature transformation
+        self.WE = self.add_weight(
+            shape=(input_shape[1][-1], self.output_dim),  # For link features
+            initializer='glorot_uniform',
+            name='edge_transform'
+        )
+
+        # Node attention weights
+        self.a = self.add_weight(
+            shape=(2 * self.output_dim + self.output_dim, 1),
+            initializer='glorot_uniform',
+            name='node_attention'
+        )
+
+        # Edge attention weights
+        self.b = self.add_weight(
+            shape=(2 * self.output_dim + self.output_dim, 1),
+            initializer='glorot_uniform',
+            name='edge_attention'
+        )
+
+        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
+
+    def node_attention(self, H, E, node_adj, training=False):
+        """
+        Compute attention for nodes in candidate paths.
+        H: betweenness values [batch_size, num_nodes]
+        E: edge features [batch_size, num_edges, edge_feat_dim]
+        node_adj: adjacency matrix for nodes in paths [batch_size, num_nodes, num_nodes]
+        """
+        # Transform node features (betweenness)
+        H_expanded = tf.expand_dims(H, -1)  # [batch, nodes, 1]
+        H_transformed = H_expanded * self.WH  # [batch, nodes, output_dim]
+        
+        # Transform edge features
+        E_transformed = tf.matmul(E, self.WE)  # [batch, edges, output_dim]
+        
+        # Compute attention scores
+        N = tf.shape(H)[1]
+        
+        # Prepare node features for attention
+        node_query = tf.expand_dims(H_transformed, 2)  # [batch, nodes, 1, dim]
+        node_key = tf.expand_dims(H_transformed, 1)    # [batch, 1, nodes, dim]
+        
+        # Average edge features for each node pair based on adjacency
+        # This assumes edge features correspond to node pairs indicated by node_adj
+        edge_contrib = tf.reduce_mean(E_transformed, axis=1, keepdims=True)  # [batch, 1, output_dim]
+        edge_contrib = tf.tile(edge_contrib, [1, N, N, 1])  # [batch, nodes, nodes, output_dim]
+        
+        # Concatenate features for attention
+        attn_features = tf.concat([
+            tf.tile(node_query, [1, 1, N, 1]),  # Source node features
+            tf.tile(node_key, [1, N, 1, 1]),    # Target node features
+            edge_contrib                         # Edge features
+        ], axis=-1)
+        
+        # Compute attention scores
+        e = tf.tanh(tf.einsum('bijf,fh->bij', attn_features, self.a))
+        
+        # Mask scores using node adjacency matrix
+        e = tf.where(node_adj > 0, e, -1e9)
+        
+        # Apply softmax and dropout
+        alpha = tf.nn.softmax(e, axis=-1)
+        if training:
+            alpha = self.dropout(alpha)
+        
+        # Compute new node features and edge-integrated features
+        H_new = tf.einsum('bij,bjf->bif', alpha, H_transformed)
+        Hm = tf.einsum('bij,bjf->bif', alpha, H_transformed * edge_contrib[:, :, :, 0])
+        
+        return H_new, Hm, alpha
+
+    def edge_attention(self, H, E, edge_adj, training=False):
+        """
+        Compute attention for edges in candidate paths.
+        H: betweenness values [batch_size, num_nodes]
+        E: edge features [batch_size, num_edges, edge_feat_dim]
+        edge_adj: adjacency matrix for edges in paths [batch_size, num_edges, num_edges]
+        """
+        # Transform edge features
+        E_transformed = tf.matmul(E, self.WE)  # [batch, edges, output_dim]
+        
+        # Average node features for each edge
+        H_avg = tf.reduce_mean(tf.expand_dims(H, -1), axis=1, keepdims=True)  # [batch, 1, 1]
+        H_avg = tf.tile(H_avg, [1, tf.shape(E)[1], 1])  # [batch, edges, 1]
+        
+        M = tf.shape(E)[1]
+        
+        # Prepare edge features for attention
+        edge_query = tf.expand_dims(E_transformed, 2)  # [batch, edges, 1, dim]
+        edge_key = tf.expand_dims(E_transformed, 1)    # [batch, 1, edges, dim]
+        
+        # Prepare node contribution
+        node_contrib = tf.tile(tf.expand_dims(H_avg, 2), [1, 1, M, 1])  # [batch, edges, edges, 1]
+        
+        # Concatenate features for attention
+        attn_features = tf.concat([
+            tf.tile(edge_query, [1, 1, M, 1]),  # Source edge features
+            tf.tile(edge_key, [1, M, 1, 1]),    # Target edge features
+            node_contrib                         # Node features
+        ], axis=-1)
+        
+        # Compute attention scores
+        e = tf.tanh(tf.einsum('bijf,fh->bij', attn_features, self.b))
+        
+        # Mask scores using edge adjacency matrix
+        e = tf.where(edge_adj > 0, e, -1e9)
+        
+        # Apply softmax and dropout
+        beta = tf.nn.softmax(e, axis=-1)
+        if training:
+            beta = self.dropout(beta)
+        
+        # Compute new edge features
+        E_new = tf.einsum('bij,bjf->bif', beta, E_transformed)
+        
+        return E_new, beta
+
+    def call(self, inputs, training=False):
+        betweenness, link_features, node_adj, edge_adj = inputs
+        # print("Betweenness in Call", betweenness)
+        # print("Link features", link_features)
+        # print("Node adj", node_adj),
+    
+        
+        # Compute node attention
+        H_new, Hm, alpha = self.node_attention(betweenness, link_features, node_adj, training)
+        
+        # Compute edge attention
+        E_new, beta = self.edge_attention(betweenness, link_features, edge_adj, training)
+        
+        return H_new, E_new, Hm, alpha, beta
+
+class DeepRMSAFeatureExtractor(tf.keras.Model):
+    def __init__(self, num_original_nodes, num_edges, k_paths, num_bands, P, hidden_size):
+        super(DeepRMSAFeatureExtractor, self).__init__()
+        self.num_original_nodes = num_original_nodes
+        self.num_edges = num_edges
+        self.k_paths = k_paths
+        self.num_bands = num_bands
+        self.hidden_size = hidden_size
+        self.P = P
+        
+        # Single EGAT layer
+        self.egat = EGATLayer(hidden_size)
+        
+        # Dense layers
+        self.dense_layers = [
+            tf.keras.layers.Dense(hidden_size, activation='relu')
+            for _ in range(5)
+        ]
+
+    def call(self, inputs, training=False):
+        batch_size = tf.shape(inputs)[0]
+        idx = 0
+        print("Batch size", batch_size, idx)
+        
+        # Extract components
+        source_dest_size = 2 * self.num_original_nodes
+        source_dest = inputs[:, idx:idx + source_dest_size]
+        idx += source_dest_size
+        
+        slots_path_size = self.k_paths
+        slots_per_path = inputs[:, idx:idx + slots_path_size]
+        idx += slots_path_size
+        
+        spectrum_size = self.k_paths * 6 * self.num_bands
+        spectrum = inputs[:, idx:idx + spectrum_size]
+        spectrum = tf.reshape(spectrum, [batch_size, self.k_paths, self.num_bands, 6])
+        idx += spectrum_size
+        
+        # Link features for edges in candidate paths
+        features_per_band = 8
+        general_link_features = 1
+        features_per_link = general_link_features + (features_per_band * self.num_bands)
+        link_features_size = self.num_edges * features_per_link
+        link_features = inputs[:, idx:idx + link_features_size]
+        link_features = tf.reshape(link_features, [batch_size, self.num_edges, -1])
+        idx += link_features_size
+        
+        # Node features (betweenness)
+        betweenness_size = self.num_original_nodes
+        betweenness = inputs[:, idx:idx + betweenness_size]
+        idx += betweenness_size
+        
+        # Adjacency matrices for nodes and edges in candidate paths
+        node_adj_size = self.num_original_nodes * self.num_original_nodes
+        node_adj = inputs[:, idx:idx + node_adj_size]
+        node_adj = tf.reshape(node_adj, [batch_size, self.num_original_nodes, self.num_original_nodes])
+        idx += node_adj_size
+        
+        edge_adj_size = self.num_edges * self.num_edges
+        edge_adj = inputs[:, idx:idx + edge_adj_size]
+        edge_adj = tf.reshape(edge_adj, [batch_size, self.num_edges, self.num_edges])
+        
+        # EGAT processing
+        H_new, E_new, Hm, alpha, beta = self.egat([betweenness, link_features, node_adj, edge_adj],training=training)
+        
+        # Concatenate features
+        c_band = spectrum[:, :, 0, :]
+        l_band = spectrum[:, :, 1, :]
+        
+        combined = tf.concat([
+            Hm,  # Edge-integrated node features
+            source_dest,
+            slots_per_path,
+            tf.reshape(c_band, [batch_size, self.k_paths * 6]),
+            tf.reshape(l_band, [batch_size, self.k_paths * 6]),
+            tf.reshape(alpha, [batch_size, -1])  # Node attention weights
+        ], axis=1)
+        
+        # Final dense processing
+        x = combined
+        for dense in self.dense_layers:
+            x = dense(x)
+            
+        return x
+
+
+class AC_Net(tf.keras.Model):
+    def __init__(self, scope, x_dim_p, x_dim_v, n_actions, num_layers, layer_size, regu_scalar,
+                 num_original_nodes, num_edges, k_paths, num_bands, P):
+        super(AC_Net, self).__init__()
+        self.scope = scope
+        self.num_layers = num_layers
+        self.layer_size = layer_size
+        self.x_dim_p = x_dim_p
+        self.n_actions = n_actions
+        self.x_dim_v = x_dim_v
+        self.regu_scalar = regu_scalar
+        
+        # Feature extraction
+        self.feature_extractor = DeepRMSAFeatureExtractor(
+            num_original_nodes=num_original_nodes,
+            num_edges=num_edges,
+            k_paths=k_paths,
+            num_bands=num_bands,
+            P=P,
+            hidden_size=layer_size
+        )
+        
+        # Policy network
+        self.policy_layer = tf.keras.layers.Dense(
+            n_actions,
+            activation='softmax',
+            kernel_regularizer=tf.keras.regularizers.l2(regu_scalar),
+            kernel_initializer=self.normalized_columns_initializer(0.01),
+            use_bias=False,
+            name='policy'
+        )
+        
+        # Value network
+        self.value_layer = tf.keras.layers.Dense(
+            1,
+            activation=None,
+            kernel_regularizer=tf.keras.regularizers.l2(regu_scalar),
+            kernel_initializer=self.normalized_columns_initializer(1.0),
+            use_bias=False,
+            name='value'
+        )
+
+    def call(self, inputs, training=False):
+        print("Inputs", inputs)
+        features = self.feature_extractor(inputs, training=training)
+        policy = self.policy_layer(features)
+        value = self.value_layer(features)
+        return policy, value
+
+    @tf.function
+    def compute_losses(self, policy, value, actions, target_v, advantages):
+        actions_onehot = tf.one_hot(actions, self.n_actions, dtype=tf.float32)
+        responsible_outputs = tf.reduce_sum(policy * actions_onehot, axis=1)
+        
+        # Policy loss
+        entropy = -tf.reduce_sum(policy * tf.math.log(policy + 1e-6))
+        policy_loss = -tf.reduce_sum(tf.math.log(responsible_outputs + 1e-6) * advantages)
+        total_policy_loss = policy_loss - 0.01 * entropy
+        
+        # Value loss
+        value_loss = tf.reduce_sum(tf.square(target_v - tf.reshape(value, [-1])))
+        
+        return total_policy_loss, value_loss, entropy
+
+    @tf.function
+    def train_step(self, inputs, actions, target_v, advantages):
+        with tf.GradientTape(persistent=True) as tape:
+            policy, value = self(inputs, training=True)
+            policy_loss, value_loss, entropy = self.compute_losses(
+                policy, value, actions, target_v, advantages
+            )
+        
+        # Get gradients
+        policy_grads = tape.gradient(policy_loss, self.policy_layer.trainable_variables)
+        value_grads = tape.gradient(value_loss, self.value_layer.trainable_variables)
+        
+        # Clip gradients
+        policy_grads, _ = tf.clip_by_global_norm(policy_grads, 40.0)
+        value_grads, _ = tf.clip_by_global_norm(value_grads, 40.0)
+        
+        return policy_loss, value_loss, entropy, policy_grads, value_grads
+
+    def normalized_columns_initializer(self, std=1.0):
+        def _initializer(shape, dtype=None):
+            out = np.random.randn(*shape).astype(np.float32)
+            out *= std / np.sqrt(np.square(out).sum(axis=0, keepdims=True))
+            return tf.constant(out)
+        return _initializer
+
+class DeepRMSA_A3C:
+    def __init__(self, env, num_layers=4, layer_size=128, learning_rate=1e-4, regu_scalar=1e-3):
+        self.env = env
+
+        # Calculate link features size
+        features_per_band = 8  # 8 features per band
+        general_link_features = 1  # spans_score
+        features_per_link = general_link_features + (features_per_band * env.num_bands)
+        link_features_size = env.topology.number_of_edges() * features_per_link
+        # Calculate total x_dim
+        self.x_dim = (
+            2 * env.topology.number_of_nodes() +    # source_dest (2 one-hot vectors)
+            env.topology.number_of_nodes() +        # node betweenness
+            env.k_paths +                          # slots_per_path
+            (env.k_paths * 6 * env.num_bands) +    # spectrum distribution 
+            link_features_size +                    # link features
+            (env.topology.number_of_nodes() * env.topology.number_of_nodes()) +  # node adjacency
+            (env.topology.number_of_edges() * env.topology.number_of_edges())    # edge adjacency
+        )
+        print("X_dim ", self.x_dim)
+
+        print("Component sizes:")
+        print(f"Source-dest: {2 * env.topology.number_of_nodes()}")
+        print(f"Betweenness: {env.topology.number_of_nodes()}")
+        print(f"Slots per path: {env.k_paths}")
+        print(f"Spectrum features: {env.k_paths * 6 * env.num_bands}")
+        print(f"Link features: {link_features_size}")
+        print(f"Node adjacency: {env.topology.number_of_nodes() * env.topology.number_of_nodes()}")
+        print(f"Edge adjacency: {env.topology.number_of_edges() * env.topology.number_of_edges()}")
+        print(f"Total x_dim: {self.x_dim}")
+
+        # Find longest path for GCN steps
+        k_shortest_paths = env.topology.graph["ksp"]
+        self.P = self.find_longest_path_by_hops(k_shortest_paths)
+        
+        # Optimizers
+        self.policy_optimizer = tf.keras.optimizers.Adam(learning_rate)
+        self.value_optimizer = tf.keras.optimizers.Adam(learning_rate)
+        
+        # Networks
+        self.global_network = AC_Net(
+            scope='global',
+            x_dim_p=self.x_dim,
+            x_dim_v=self.x_dim,
+            n_actions=env.action_space.n,
+            num_layers=num_layers,
+            layer_size=layer_size,
+            regu_scalar=regu_scalar,
+            num_original_nodes=env.topology.number_of_nodes(),
+            num_edges=env.topology.number_of_edges(),
+            k_paths=env.k_paths,
+            num_bands=env.num_bands,
+            P=self.P
+        )
+        
+        self.local_network = AC_Net(
+            scope='worker',
+            x_dim_p=self.x_dim,
+            x_dim_v=self.x_dim,
+            n_actions=env.action_space.n,
+            num_layers=num_layers,
+            layer_size=layer_size,
+            regu_scalar=regu_scalar,
+            num_original_nodes=env.topology.number_of_nodes(),
+            num_edges=env.topology.number_of_edges(),
+            k_paths=env.k_paths,
+            num_bands=env.num_bands,
+            P=self.P
+        )
+        
+        # Initialize networks
+        dummy_state = tf.zeros([1, self.x_dim])
+        self.global_network(dummy_state)
+        self.local_network(dummy_state)
+        
+        # Copy weights from global to local network
+        self.sync_networks()
+        
+        # Metrics
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.episode_blocking_rates = []
+
+    def find_longest_path_by_hops(self, k_shortest_paths):
+        max_hops = 0
+        for (src, dst), paths in k_shortest_paths.items():
+            for path in paths:
+                num_hops = len(path.node_list) - 1
+                if num_hops > max_hops:
+                    max_hops = num_hops
+        return max_hops
+
+    @tf.function
+    def choose_action(self, state, deterministic=False):
+        policy, _ = self.local_network(tf.expand_dims(state, 0))
+        policy = policy[0]
+        
+        if deterministic:
+            return tf.argmax(policy)
+        else:
+            return tf.random.categorical(tf.math.log(policy + 1e-10)[None, :], 1)[0, 0]
+
+    def sync_networks(self):
+        """Copy weights from global to local network."""
+        for local_var, global_var in zip(
+            self.local_network.trainable_variables,
+            self.global_network.trainable_variables
+        ):
+            local_var.assign(global_var)
+
+    @tf.function
+    def update_networks(self, states, actions, returns, advantages):
+        # Update networks using gradient tape
+        policy_loss, value_loss, entropy, policy_grads, value_grads = \
+            self.local_network.train_step(states, actions, returns, advantages)
+            
+        # Apply gradients to global network
+        self.policy_optimizer.apply_gradients(
+            zip(policy_grads, self.global_network.policy_layer.trainable_variables)
+        )
+        self.value_optimizer.apply_gradients(
+            zip(value_grads, self.global_network.value_layer.trainable_variables)
+        )
+        
+        # Sync networks
+        self.sync_networks()
+        
+        return policy_loss, value_loss, entropy
+
+    def train(self, total_timesteps, gamma=0.99, bootstrap_value=True, n_steps=5):
+        episode_count = 0
+        total_steps = 0
+        current_service_count = 0  # Count services within an episode
+        start_time = time.time()
+        
+        # Initialize buffers for n_steps
+        states = []
+        actions = []
+        rewards = []
+        
+        state = self.env.reset()
+        print("Initial state after reset:", state[:28])
+        episode_reward = 0
+
+        # Create progress bar for episode length
+        pbar = tqdm(total=self.env.episode_length, desc="Episode Progress")
+        
+        while total_steps < total_timesteps:
+            print("State before choose_action:", state[:28])
+            action = self.choose_action(state)
+            next_state, reward, done, info = self.env.step(action.numpy())
+            
+            # Store experience
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
+            
+            episode_reward += reward
+            total_steps += 1
+            current_service_count += 1
+            state = next_state
+
+            # Update progress bar
+            pbar.update(1)
+            
+            # Update network every n service requests or at episode end
+            if current_service_count % n_steps == 0 or done:
+                # Get bootstrap value
+                if bootstrap_value:
+                    _, value = self.local_network(tf.expand_dims(state, 0))
+                    bootstrap_value = value.numpy()[0, 0]
+                else:
+                    bootstrap_value = 0
+                    
+                # Convert to tensors
+                states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
+                actions_tensor = tf.convert_to_tensor(actions, dtype=tf.int32)
+                rewards_array = np.array(rewards)
+                
+                # Compute returns and advantages
+                rewards_plus = np.append(rewards_array, bootstrap_value)
+                discounted_returns = tf.convert_to_tensor(
+                    self.discount(rewards_plus, gamma)[:-1], 
+                    dtype=tf.float32
+                )
+                
+                # Get values
+                _, values = self.local_network(states_tensor)
+                values = tf.squeeze(values)
+                
+                # Compute advantages
+                advantages = discounted_returns - values
+                
+                # Update networks
+                policy_loss, value_loss, entropy = self.update_networks(
+                    states_tensor, actions_tensor, discounted_returns, advantages
+                )
+                
+                # Clear buffers
+                states = []
+                actions = []
+                rewards = []
+            
+            # Handle episode completion (100 service requests)
+            if done:
+                episode_count += 1
+                self.episode_rewards.append(episode_reward)
+                self.episode_blocking_rates.append(
+                    info.get('episode_service_blocking_rate', 0)
+                )
+                
+                # Reset episode stats
+                state = self.env.reset()
+                episode_reward = 0
+                current_service_count = 0
+
+                # Reset progress bar for next episode
+                pbar.reset()
+                
+                # Log progress
+                #if episode_count % 1 == 0:  # Log every episode
+                mean_reward = np.mean(self.episode_rewards[-10:])
+                mean_blocking = np.mean(self.episode_blocking_rates[-10:])
+                fps = int(total_steps / (time.time() - start_time))
+                    # print(f"Episode: {episode_count}")
+                    # print(f"Mean Reward: {mean_reward:.2f}")
+                    # print(f"Mean Blocking Rate: {mean_blocking:.4f}")
+                    # print(f"Policy Loss: {policy_loss:.4f}")
+                    # print(f"Value Loss: {value_loss:.4f}")
+                    # print(f"Entropy: {entropy:.4f}")
+                    # print(f"FPS: {fps}\n")
+
+                pbar.set_postfix({
+                        'episode': episode_count,
+                        'mean_reward': f'{mean_reward:.2f}',
+                        'mean_blocking': f'{mean_blocking:.4f}',
+                        # 'fps': fps,
+                        # 'policy_loss': f'{policy_loss:.4f}',
+                        # 'value_loss': f'{value_loss:.4f}'
+                    })
+    
+        # Close progress bar
+        pbar.close()
+        
+        return self
+
+    def log_progress(self, episode_count, total_steps, total_timesteps, 
+                    start_time, policy_loss, value_loss, entropy):
+        mean_reward = np.mean(self.episode_rewards[-100:])
+        mean_length = np.mean(self.episode_lengths[-100:])
+        mean_blocking = np.mean(self.episode_blocking_rates[-100:])
+        fps = int(total_steps / (time.time() - start_time))
+        
+        print(f"Episode: {episode_count}")
+        print(f"Steps: {total_steps}/{total_timesteps}")
+        print(f"Mean Reward: {mean_reward:.2f}")
+        print(f"Mean Length: {mean_length:.2f}")
+        print(f"Mean Blocking Rate: {mean_blocking:.4f}")
+        print(f"FPS: {fps}")
+        print(f"Policy Loss: {policy_loss:.4f}")
+        print(f"Value Loss: {value_loss:.4f}")
+        print(f"Entropy: {entropy:.4f}\n")
+
+    def discount(self, x, gamma):
+        """Compute discounted returns."""
+        return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
+
+
+
+
+
+class SaveOnBestTrainingCallback:
+    def __init__(self, check_freq, log_dir, verbose=1):
         self.check_freq = check_freq
         self.log_dir = log_dir
-        self.save_path = os.path.join(log_dir, 'best_model')
+        self.verbose = verbose
         self.best_mean_reward = -np.inf
-
-    def _init_callback(self) -> None:
-        if self.save_path is not None:
-            os.makedirs(self.save_path, exist_ok=True)
-
-    def _on_step(self) -> bool:
-        if self.n_calls % self.check_freq == 0:
-            # Get current reward mean from all previous logs
-            x, y = ts2xy(load_results(self.log_dir), 'timesteps')
-            if len(x) > 0:
-                mean_reward = np.mean(y[-100:])
-                if self.verbose > 0:
-                    print(f"Num timesteps: {self.num_timesteps}")
-                    print(f"Best mean reward: {self.best_mean_reward:.2f} - Last mean reward: {mean_reward:.2f}")
-
-                # Save the model if mean reward is better
-                if mean_reward > self.best_mean_reward:
-                    self.best_mean_reward = mean_reward
-                    if self.verbose > 0:
-                        print(f"Saving new best model to {self.save_path}")
-                    self.model.save(self.save_path)
-
+        
+    def on_step(self, locals, globals):
+        if len(locals['self'].episode_rewards) < self.check_freq:
+            return True
+            
+        mean_reward = np.mean(locals['self'].episode_rewards[-self.check_freq:])
+        
+        if mean_reward > self.best_mean_reward:
+            self.best_mean_reward = mean_reward
+            if self.verbose > 0:
+                print(f"Saving new best model with mean reward: {mean_reward:.2f}")
+            locals['self'].save(os.path.join(self.log_dir, 'best_model'))
+            
         return True
 
 def main():
-    # Create directories
-    log_dir = "./tmp/deeprmsa-egat-a2c/"
-    os.makedirs(log_dir, exist_ok=True)
-
+    # Set random seeds
+    tf.random.set_seed(42)
+    np.random.seed(42)
+    
+    # Set up TensorFlow GPU memory growth
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    
     # Load topology
-    topology_name = 'nsfnet_chen_link_span'
+    topology_name = 'nsfnet_chen'
     k_paths = 5
-    with open(f'../topologies/{topology_name}_{k_paths}-paths_6-modulations.h5', 'rb') as f:
+    with open(f'../topologies/{topology_name}_{k_paths}-paths_new.h5', 'rb') as f:
         topology = pickle.load(f)
 
     # Environment setup
     env_args = dict(
         num_bands=2,
-        topology=topology, 
+        topology=topology,
         seed=10,
         allow_rejection=False,
-        mean_service_holding_time=5,
+        j=1,
+        mean_service_holding_time=15.0,
         mean_service_inter_arrival_time=0.1,
-        k_paths=5,
-        episode_length=100
+        k_paths=k_paths,
+        episode_length=1000,
+        node_request_probabilities=None
     )
 
-    # Monitor keywords for logging
-    monitor_info_keywords = (
-        "service_blocking_rate",
-        "episode_service_blocking_rate",
-        "bit_rate_blocking_rate",
-        "episode_bit_rate_blocking_rate"
-    )
+    # Create directories with timestamp
+    current_time = datetime.now().strftime('%Y%m%d-%H%M%S')
+    log_dir = f"./logs/deeprmsa-a3c/{current_time}"
+    model_dir = f"./models/deeprmsa-a3c/{current_time}"
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Set up TensorBoard
+    #summary_writer = tf.summary.create_file_writer(log_dir)
 
     # Create and wrap environment
     env = gym.make('DeepRMSA-v0', **env_args)
-    env = Monitor(env, log_dir + 'training', info_keywords=monitor_info_keywords)
-
-    # Initialize A2C with custom EGAT policy
-    model = A2C(
-        CustomActorCriticPolicy,
-        env,
-        verbose=1,
-        tensorboard_log="./tb/EGAT-DeepRMSA-A2C/",
-        learning_rate=7e-4,
-        n_steps=3,           # Number of steps before updating
-        gamma=0.99,          # Discount factor
-        gae_lambda=1.0,      # GAE parameter
-        ent_coef=0.01,       # Entropy coefficient
-        vf_coef=0.5,         # Value function coefficient
-        max_grad_norm=0.5,   # Gradient clipping
-        rms_prop_eps=1e-5,   # RMSprop epsilon
-        use_rms_prop=True,   # Use RMSprop optimizer
-        normalize_advantage=True
+    
+    # Create A3C model
+    model = DeepRMSA_A3C(
+        env=env,
+        num_layers=4,
+        layer_size=128,
+        learning_rate=1e-4,
+        regu_scalar=1e-3
     )
 
     # Create callback
-    callback = SaveOnBestTrainingRewardCallback(
-        check_freq=1000,
-        log_dir=log_dir,
-        verbose=1
+    callback = SaveOnBestTrainingCallback(
+        check_freq=100,
+        log_dir=model_dir,
+        verbose=1,
+        #summary_writer=summary_writer
     )
 
-    # Train the agent
-    total_timesteps = 1000000
+    # Training hyperparameters
+    training_params = {
+        'total_timesteps': 1000000,
+        'gamma': 0.95,
+        'bootstrap_value': True
+    }
+
+    # Save training parameters
+    with open(os.path.join(log_dir, 'training_params.txt'), 'w') as f:
+        for key, value in training_params.items():
+            f.write(f"{key}: {value}\n")
+
+    # Log configuration
+    print("Starting training...")
+    print(f"Logging to {log_dir}")
+    print(f"Models will be saved to {model_dir}")
+    print("\nTraining parameters:")
+    for key, value in training_params.items():
+        print(f"{key}: {value}")
+    print("\nEnvironment parameters:")
+    for key, value in env_args.items():
+        print(f"{key}: {value}")
+    print("\nModel parameters:")
+    print(f"Number of layers: {model.local_network.num_layers}")
+    print(f"Layer size: {model.local_network.layer_size}")
+    print(f"Learning rate: {model.policy_optimizer.learning_rate.numpy()}")
+    print(f"Regularization scalar: {model.local_network.regu_scalar}")
+
     try:
-        model.learn(
-            total_timesteps=total_timesteps,
-            callback=callback,
-            tb_log_name="egat_a2c_run"
+        # Train the model
+        model.train(
+            total_timesteps=training_params['total_timesteps'],
+            gamma=training_params['gamma'],
+            bootstrap_value=training_params['bootstrap_value'],
+            #callback=callback
+            n_steps=1
         )
         
         # Save final model
-        model.save(f"{log_dir}/final_model")
+        final_model_path = "./models/deeprmsa-a3c/20250127-205303/final_model.weights.h5"
+        model.global_network.save_weights(final_model_path)
+        print(f"\nTraining completed. Final model saved to {final_model_path}")
         
     except KeyboardInterrupt:
-        print("Training interrupted! Saving current model...")
-        model.save(f"{log_dir}/interrupted_model")
-
-    # Test the trained model
-    print("Testing trained model...")
-    obs = env.reset()
-    done = False
-    total_reward = 0
-    num_steps = 0
-
-    while not done:
-        action, _states = model.predict(obs, deterministic=True)
-        obs, reward, done, info = env.step(action)
-        total_reward += reward
-        num_steps += 1
-
-        if num_steps % 100 == 0:
-            print(f"Step {num_steps}, Current blocking rate: {info['service_blocking_rate']:.4f}")
-
-    print(f"Testing completed!")
-    print(f"Final service blocking rate: {info['service_blocking_rate']:.4f}")
-    print(f"Final bit rate blocking rate: {info['bit_rate_blocking_rate']:.4f}")
+        print("\nTraining interrupted by user")
+        # Save interrupted model
+        interrupted_model_path = os.path.join(model_dir, 'interrupted_model')
+        model.global_network.save_weights(interrupted_model_path)
+        print(f"Interrupted model saved to {interrupted_model_path}")
+        
+    finally:
+        # Save training curves
+        training_data = {
+            'rewards': model.episode_rewards,
+            'lengths': model.episode_lengths,
+            'blocking_rates': model.episode_blocking_rates
+        }
+        np.save(os.path.join(log_dir, 'training_data.npy'), training_data)
+        
+        # Close environment
+        env.close()
+        
+        # Final TensorBoard flush
+        #summary_writer.flush()
 
 if __name__ == "__main__":
     main()
+
