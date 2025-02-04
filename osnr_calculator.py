@@ -10,40 +10,9 @@ from dataclasses import dataclass
 from typing import List, Dict
 from optical_rl_gym.utils import PhysicalParameters
 
-import logging
-
-def setup_logger():
-    # Create logger
-    logger = logging.getLogger('DeepRMSA')
-    logger.setLevel(logging.DEBUG)
-
-    # Create console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
-
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s] - %(message)s')
-    console_handler.setFormatter(formatter)
-
-    # Add handler to logger
-    logger.addHandler(console_handler)
-
-    # Prevent duplicate logs
-    logger.propagate = False
-
-    return logger
-
-# Add this at the start of your script
-logger = setup_logger()
-
-
 class OSNRCalculator:
     def __init__(self):
         self.physical_params = PhysicalParameters()
-
-        self.logger = logging.getLogger('osnr logger')
-
-    
 
     def calculate_dispersion_params(self, freq_r: float, freq_r_prime: float = None) -> float:
         """Calculate dispersion parameters phi_r or phi_r_r_prime"""
@@ -118,30 +87,39 @@ class OSNRCalculator:
         if d_l == 0:
             return 0
         #print("Other service in link",  d_l)
-        self.logger.debug(f"Number of other services in link {current_node}->{next_node}: {d_l}")
-
         factor = n_spans * (16/81) * ((self.physical_params.gamma**2) * (self.physical_params.launch_power**3)) / (pi**2 * self.physical_params.alpha**2)
         inside_sum = 0
         for other_service in topology[current_node][next_node]['running_services']:
             #print("Running services id", other_service.service_id, "Current service id", service.service_id)
             if other_service.service_id != service.service_id:
+                #print("Other Service", other_service)
                 phi_r_r_prime = self.calculate_dispersion_params(service.center_frequency, other_service.center_frequency)
+                # print("phi_r_r_prime",phi_r_r_prime)
+                # print("OBW", other_service.bandwidth)
+                # Add check for zero division
+                denominator = phi_r_r_prime * other_service.bandwidth
+                if denominator == 0:
+                    print(f"Error: Zero division detected in XCI calculation")
+                    print(f"phi_r_r_prime: {phi_r_r_prime}")
+                    print(f"Other bandwidth: {other_service.bandwidth}")
+                    print(f"Current service CF: {service.center_frequency}")
+                    print(f"Other service CF: {other_service.center_frequency}")
+
+                    print(f"service id: {service.service_id}")
+                    print(f"other service id: {other_service.service_id}")
+                    return 0
+                    #raise ValueError("Divide by zero encountered in XCI calculation")
                 
-                print("phi_r_r_prime", phi_r_r_prime)
-                print("other_service.bandwidth", other_service.bandwidth)
 
                 inside_sum_factor = (1/(phi_r_r_prime * other_service.bandwidth))
                 #print("Other service bandwidth", other_service.bandwidth)
                 #print("Factor in xci", factor)
+                #print("other_service.center_frequency",other_service.center_frequency)
+                const1=(2*self.physical_params.alpha - d_l* self.physical_params.launch_power* self.physical_params.cr* other_service.center_frequency)**2
                 
-                term1 = ((2*self.physical_params.alpha - d_l*self.physical_params.launch_power*
-                        self.physical_params.cr*other_service.center_frequency)**2 - 
-                        self.physical_params.alpha**2) / self.physical_params.alpha
+                term1 = ( const1 - self.physical_params.alpha**2) / self.physical_params.alpha
                 
-                term2 = (4*self.physical_params.alpha**2 - 
-                        (2*self.physical_params.alpha - d_l*self.physical_params.launch_power*
-                        self.physical_params.cr*other_service.center_frequency)**2) / \
-                        (2*self.physical_params.alpha)
+                term2 = (4*self.physical_params.alpha**2 - const1) / (2*self.physical_params.alpha)
                 
                 
                 inside_sum  += inside_sum_factor * (term1 * atan((2*pi**2/self.physical_params.alpha) * phi_r_r_prime * service.bandwidth) + (term2 * 
